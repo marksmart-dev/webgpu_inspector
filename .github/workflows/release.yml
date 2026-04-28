@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build extensions
+        run: npm run build
+
+      - name: Validate build outputs
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "Expected version: $VERSION"
+
+          CHROME_VERSION=$(jq -r '.version' extensions/chrome/manifest.json)
+          if [ "$CHROME_VERSION" != "$VERSION" ]; then
+            echo "ERROR: Chrome manifest version mismatch"
+            exit 1
+          fi
+
+          FIREFOX_VERSION=$(jq -r '.version' extensions/firefox/manifest.json)
+          if [ "$FIREFOX_VERSION" != "$VERSION" ]; then
+            echo "ERROR: Firefox manifest version mismatch"
+            exit 1
+          fi
+
+          echo "Version validation passed."
+
+      - name: Package Chrome extension
+        run: |
+          cd extensions/chrome
+          zip -r ../../webgpu-inspector-chrome.zip . -x "*.map"
+
+      - name: Package Firefox extension
+        run: |
+          cd extensions/firefox
+          zip -r ../../webgpu-inspector-firefox.zip . -x "*.map"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            webgpu-inspector-chrome.zip
+            webgpu-inspector-firefox.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

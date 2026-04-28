@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    name: Build & Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build extensions
+        run: npm run build
+
+      - name: Validate build outputs
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "Expected version: $VERSION"
+
+          # Check Chrome manifest
+          CHROME_VERSION=$(jq -r '.version' extensions/chrome/manifest.json)
+          if [ "$CHROME_VERSION" != "$VERSION" ]; then
+            echo "ERROR: Chrome manifest version ($CHROME_VERSION) does not match VERSION file ($VERSION)"
+            exit 1
+          fi
+
+          # Check Firefox manifest
+          FIREFOX_VERSION=$(jq -r '.version' extensions/firefox/manifest.json)
+          if [ "$FIREFOX_VERSION" != "$VERSION" ]; then
+            echo "ERROR: Firefox manifest version ($FIREFOX_VERSION) does not match VERSION file ($VERSION)"
+            exit 1
+          fi
+
+          # Check critical files exist
+          for variant in chrome firefox; do
+            for file in manifest.json background.js content_script.js webgpu_inspector.js webgpu_inspector_devtools.html; do
+              if [ ! -f "extensions/$variant/$file" ]; then
+                echo "ERROR: Missing extensions/$variant/$file"
+                exit 1
+              fi
+            done
+            echo "extensions/$variant OK"
+          done
+
+          echo "All validations passed."
+
+      - name: Package Chrome extension
+        run: |
+          cd extensions/chrome
+          zip -r ../../webgpu-inspector-chrome.zip . -x "*.map"
+          cd ../..
+          ls -lh webgpu-inspector-chrome.zip
+
+      - name: Package Firefox extension
+        run: |
+          cd extensions/firefox
+          zip -r ../../webgpu-inspector-firefox.zip . -x "*.map"
+          cd ../..
+          ls -lh webgpu-inspector-firefox.zip
+
+      - name: Upload Chrome artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webgpu-inspector-chrome
+          path: webgpu-inspector-chrome.zip
+
+      - name: Upload Firefox artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webgpu-inspector-firefox
+          path: webgpu-inspector-firefox.zip
+
+      - name: Upload full build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: extensions-build
+          path: |
+            extensions/chrome
+            extensions/firefox
+
+  lint-firefox:
+    name: Lint Firefox Extension
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download Firefox artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: webgpu-inspector-firefox
+
+      - name: Unzip Firefox extension
+        run: unzip webgpu-inspector-firefox.zip -d firefox-ext
+
+      - name: Run web-ext lint
+        run: |
+          npm install -g web-ext
+          web-ext lint --source-dir=firefox-ext

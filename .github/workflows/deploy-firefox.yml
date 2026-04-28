@@ -1,0 +1,56 @@
+name: Deploy to Firefox Add-ons
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to deploy (e.g., v1.0.2)'
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    name: Publish to Firefox Add-ons
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build extensions
+        run: npm run build
+
+      - name: Package Firefox extension
+        run: |
+          cd extensions/firefox
+          zip -r ../../webgpu-inspector-firefox.zip . -x "*.map"
+
+      # Requires the following secrets to be set in repository settings:
+      #   FIREFOX_API_KEY    - JWT issuer from AMO Developer Hub
+      #   FIREFOX_API_SECRET - JWT secret from AMO Developer Hub
+      - name: Publish to Firefox Add-ons
+        if: ${{ secrets.FIREFOX_API_KEY != '' }}
+        run: |
+          npm install -g web-ext
+          web-ext sign \
+            --source-dir=extensions/firefox \
+            --api-key=${{ secrets.FIREFOX_API_KEY }} \
+            --api-secret=${{ secrets.FIREFOX_API_SECRET }} \
+            --channel=listed
+
+      - name: Skip publish (secrets not configured)
+        if: ${{ secrets.FIREFOX_API_KEY == '' }}
+        run: |
+          echo "Firefox Add-ons secrets not configured. Skipping publish."
+          echo "To enable deployment, add these secrets in GitHub repository settings:"
+          echo "  - FIREFOX_API_KEY"
+          echo "  - FIREFOX_API_SECRET"
