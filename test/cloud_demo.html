@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebGPU Cloud Demo</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #info {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: white;
+      font-family: monospace;
+      background: rgba(0,0,0,0.5);
+      padding: 8px 12px;
+      border-radius: 4px;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="info">WebGPU Cloud Demo — Open DevTools > WebGPU Inspector</div>
+
+  <script type="module">
+    const canvas = document.getElementById('canvas');
+
+    async function init() {
+      if (!navigator.gpu) {
+        document.getElementById('info').textContent = 'WebGPU not supported. Use Chrome Canary with WebGPU enabled.';
+        return;
+      }
+
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) {
+        document.getElementById('info').textContent = 'Failed to get WebGPU adapter.';
+        return;
+      }
+
+      const device = await adapter.requestDevice();
+      const context = canvas.getContext('webgpu');
+
+      const format = navigator.gpu.getPreferredCanvasFormat();
+      context.configure({ device, format });
+
+      // Fullscreen quad
+      const vertices = new Float32Array([
+        -1, -1,  1, -1,  -1, 1,
+        -1,  1,  1, -1,   1, 1,
+      ]);
+
+      const vertexBuffer = device.createBuffer({
+        size: vertices.byteLength,
+        usage: GPUBufferUsage.VERTEX,
+        mappedAtCreation: true,
+      });
+      new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
+      vertexBuffer.unmap();
+
+      // Uniforms: time, resolution
+      const uniformBuffer = device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+
+      const shaderCode = `
+        struct Uniforms {
+          time: f32,
+          resolutionX: f32,
+          resolutionY: f32,
+          _pad: f32,
+        };
+        @binding(0) @group(0) var<uniform> u: Uniforms;
+
+        fn hash(n: f32) -> f32 {
+          return fract(sin(n * 127.1) * 43758.5453);
+        }
+
+        fn hash2(p: vec2<f32>) -> f32 {
+          return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+        }
+
+        fn sdCircle(p: vec2<f32>, center: vec2<f32>, radius: f32) -> f32 {
+          return length(p - center) - radius;
+        }
+
+        fn smoothCircle(p: vec2<f32>, center: vec2<f32>, radius: f32) -> f32 {
+          let d = sdCircle(p, center, radius);
+          return 1.0 - smoothstep(-0.02, 0.04, d);
+        }
+
+        // Build a cartoon cloud from overlapping circles using SDF union
+        fn vectorCloud(p: vec2<f32>, cx: f32, cy: f32, scale: f32) -> f32 {
+          // SDF for each circle (negative inside, positive outside)
+          let d0 = sdCircle(p, vec2<f32>(cx, cy), scale * 0.35);
+          let d1 = sdCircle(p, vec2<f32>(cx - scale * 0.28, cy - scale * 0.06), scale * 0.24);
+          let d2 = sdCircle(p, vec2<f32>(cx - scale * 0.48, cy - scale * 0.12), scale * 0.18);
+          let d3 = sdCircle(p, vec2<f32>(cx + scale * 0.28, cy - scale * 0.04), scale * 0.25);
+          let d4 = sdCircle(p, vec2<f32>(cx + scale * 0.50, cy - scale * 0.10), scale * 0.19);
+          let d5 = sdCircle(p, vec2<f32>(cx - scale * 0.12, cy + scale * 0.18), scale * 0.22);
+          let d6 = sdCircle(p, vec2<f32>(cx + scale * 0.14, cy + scale * 0.16), scale * 0.20);
+
+          // Union: min distance to any circle
+          var d = d0;
+          d = min(d, d1);
+          d = min(d, d2);
+          d = min(d, d3);
+          d = min(d, d4);
+          d = min(d, d5);
+          d = min(d, d6);
+
+          // Single anti-alias step — no internal seams
+          return 1.0 - smoothstep(-0.005, 0.015, d);
+        }
+
+        // A small cotton-ball puff particle
+        fn puffParticle(p: vec2<f32>, center: vec2<f32>, size: f32) -> f32 {
+          let d = length(p - center);
+          // Very round, cartoon bubble edge
+          return 1.0 - smoothstep(0.0, size, d);
+        }
+
+        // Per-cloud random light grey
+        fn cloudGrey(idx: f32) -> vec3<f32> {
+          let h = hash(idx * 37.13 + 13.71);
+          let grey = 0.82 + h * 0.14;
+          return vec3<f32>(grey, grey, grey);
+        }
+
+        @vertex
+        fn vs_main(@location(0) pos: vec2<f32>) -> @builtin(position) vec4<f32> {
+          return vec4<f32>(pos, 0.0, 1.0);
+        }
+
+        @fragment
+        fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+          let uv = fragCoord.xy / vec2<f32>(u.resolutionX, u.resolutionY);
+
+          // Sky: cartoon light blue #87cffa = rgb(135,207,250)
+          let skyColor = vec3<f32>(0.529, 0.812, 0.980);
+          var col = skyColor;
+
+          let time = u.time;
+          let aspect = u.resolutionX / u.resolutionY;
+          let p = vec2<f32>(uv.x * aspect, uv.y);
+
+          // =============================
+          // VECTOR CLOUDS: solid flat light greys
+          // =============================
+          var cloudMask = 0.0;
+          var cloudColor = vec3<f32>(1.0);
+
+          // Cloud 1: big, slow drift
+          let m1 = vectorCloud(p, fract(time * 0.03 + 0.10) * (aspect + 1.4) - 0.7, 0.72, 0.55);
+          if (m1 > cloudMask) { cloudMask = m1; cloudColor = cloudGrey(1.0); }
+
+          // Cloud 2: medium, mid-speed
+          let m2 = vectorCloud(p, fract(time * 0.045 + 0.55) * (aspect + 1.2) - 0.6, 0.50, 0.38);
+          if (m2 > cloudMask) { cloudMask = m2; cloudColor = cloudGrey(2.0); }
+
+          // Cloud 3: large, slow drift behind
+          let m3 = vectorCloud(p, fract(time * 0.025 + 0.85) * (aspect + 1.6) - 0.8, 0.82, 0.42);
+          if (m3 > cloudMask) { cloudMask = m3; cloudColor = cloudGrey(3.0); }
+
+          // Cloud 4: small and fast
+          let m4 = vectorCloud(p, fract(time * 0.065 + 0.30) * (aspect + 1.0) - 0.5, 0.35, 0.28);
+          if (m4 > cloudMask) { cloudMask = m4; cloudColor = cloudGrey(4.0); }
+
+          // Cloud 5: medium high up
+          let m5 = vectorCloud(p, fract(time * 0.035 + 0.70) * (aspect + 1.3) - 0.65, 0.60, 0.32);
+          if (m5 > cloudMask) { cloudMask = m5; cloudColor = cloudGrey(5.0); }
+
+          // Fade clouds near horizon
+          let horizonFade = smoothstep(0.0, 0.22, uv.y);
+          cloudMask = cloudMask * horizonFade;
+
+          col = mix(col, cloudColor, cloudMask);
+
+          // =============================
+          // PARTICLE EMITTER: cotton puffs
+          // =============================
+          var particleMask = 0.0;
+          var particleColor = vec3<f32>(1.0, 1.0, 1.0);
+
+          // 30 small puffs drifting upward
+          for (var i = 0; i < 30; i = i + 1) {
+            let fi = f32(i);
+            let seed = fi * 17.31 + 42.0;
+
+            // Spawn area: bottom of screen, scattered x
+            let baseX = hash(seed) * aspect * 1.2 - aspect * 0.1;
+            let baseY = hash(seed + 1.0) * 0.15 - 0.05;
+
+            // Drift: slow upward + slight horizontal sway
+            let driftY = fract(hash(seed + 2.0) + time * 0.04 + fi * 0.017) * 1.3;
+            let sway = sin(time * 1.5 + fi * 2.7) * 0.03;
+            let px = baseX + sway;
+            let py = baseY + driftY;
+
+            // Size cycles slightly
+            let size = 0.018 + hash(seed + 3.0) * 0.022;
+
+            // Fade in/out near lifetime edges
+            let lifetime = fract(hash(seed + 2.0) + time * 0.04 + fi * 0.017);
+            let fade = smoothstep(0.0, 0.15, lifetime) * (1.0 - smoothstep(0.75, 1.0, lifetime));
+
+            let pMask = puffParticle(p, vec2<f32>(px, py), size);
+            let strength = pMask * fade;
+
+            // Track the strongest particle's color
+            if (strength > particleMask) {
+              particleMask = strength;
+
+              let hue = hash(seed + 10.0);
+              if (hue < 0.166) {
+                particleColor = vec3<f32>(0.957, 0.761, 0.761); // pastel pink
+              } else if (hue < 0.333) {
+                particleColor = vec3<f32>(0.847, 0.749, 0.847); // muted lavender
+              } else if (hue < 0.500) {
+                particleColor = vec3<f32>(0.722, 0.878, 0.824); // soft mint
+              } else if (hue < 0.666) {
+                particleColor = vec3<f32>(0.973, 0.843, 0.761); // pale peach
+              } else if (hue < 0.833) {
+                particleColor = vec3<f32>(0.655, 0.780, 0.906); // dusty blue
+              } else {
+                particleColor = vec3<f32>(0.941, 0.902, 0.549); // pale yellow
+              }
+            }
+          }
+
+          col = mix(col, particleColor, particleMask * 0.85);
+
+          return vec4<f32>(col, 1.0);
+        }
+      `;
+
+      const shaderModule = device.createShaderModule({ code: shaderCode });
+
+      const pipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: {
+          module: shaderModule,
+          entryPoint: 'vs_main',
+          buffers: [{
+            arrayStride: 8,
+            attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }],
+          }],
+        },
+        fragment: {
+          module: shaderModule,
+          entryPoint: 'fs_main',
+          targets: [{ format }],
+        },
+        primitive: { topology: 'triangle-list' },
+      });
+
+      const bindGroup = device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [{
+          binding: 0,
+          resource: { buffer: uniformBuffer },
+        }],
+      });
+
+      function resize() {
+        const dpr = Math.min(window.devicePixelRatio, 2);
+        canvas.width = Math.floor(canvas.clientWidth * dpr);
+        canvas.height = Math.floor(canvas.clientHeight * dpr);
+      }
+      window.addEventListener('resize', resize);
+      resize();
+
+      const startTime = performance.now();
+
+      function frame() {
+        const time = (performance.now() - startTime) / 1000;
+
+        const uniforms = new Float32Array([time, canvas.width, canvas.height, 0]);
+        device.queue.writeBuffer(uniformBuffer, 0, uniforms);
+
+        const commandEncoder = device.createCommandEncoder();
+        const textureView = context.getCurrentTexture().createView();
+
+        const renderPass = commandEncoder.beginRenderPass({
+          colorAttachments: [{
+            view: textureView,
+            loadOp: 'clear',
+            storeOp: 'store',
+            clearValue: { r: 0.529, g: 0.812, b: 0.980, a: 1.0 },
+          }],
+        });
+
+        renderPass.setPipeline(pipeline);
+        renderPass.setBindGroup(0, bindGroup);
+        renderPass.setVertexBuffer(0, vertexBuffer);
+        renderPass.draw(6);
+        renderPass.end();
+
+        device.queue.submit([commandEncoder.finish()]);
+        requestAnimationFrame(frame);
+      }
+
+      requestAnimationFrame(frame);
+      document.getElementById('info').textContent = 'WebGPU Cloud Demo Running — Open DevTools (F12) > WebGPU Inspector tab';
+    }
+
+    init().catch(err => {
+      console.error(err);
+      document.getElementById('info').textContent = 'Error: ' + err.message;
+    });
+  </script>
+</body>
+</html>
